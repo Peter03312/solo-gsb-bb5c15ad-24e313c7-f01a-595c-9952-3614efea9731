@@ -196,6 +196,27 @@ body {
 .seg-body.selectable ::selection { background: #c8d39c; }
 .seg-body.selectable { cursor: text; }
 
+/* 保密段 */
+.seg-confidential .seg-no { color: var(--danger); font-weight: 700; }
+.seg-confidential .seg-body {
+  background: repeating-linear-gradient(45deg, #f7f3ee, #f7f3ee 8px, #f1ede5 8px, #f1ede5 16px);
+  border: 1px dashed var(--relo-border);
+  border-radius: 6px;
+  padding: 6px 12px;
+}
+.confidential-placeholder {
+  color: #8a5a44;
+  font-weight: 700;
+  letter-spacing: 1px;
+  user-select: none;
+}
+.seg-secret-ctrl { margin-top: 6px; }
+.seg-secret-ctrl .btn.secret-on { color: var(--danger); border-color: #d9b5af; }
+.secret-tag { font-size: 12px; color: var(--danger); }
+.secret-intro { margin-bottom: 10px; line-height: 1.6; }
+.secret-h { font-size: 13px; color: var(--primary-dark); margin: 14px 0 8px; }
+.secret-form select { margin-bottom: 0; }
+
 /* 标记 */
 .mk { border-radius: 2px; padding: 0 1px; cursor: pointer; border-bottom: 2px solid transparent; }
 .mk-adopted { background: var(--adopt-bg); border-bottom-color: var(--adopt-border); }

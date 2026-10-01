@@ -474,8 +474,8 @@ async function main() {
     `门槛列出待回应异议 #${oaid}，关联已采纳提议 #${q1.json.id}，尚无回应`);
   ok(!gate.items.some((x) => x.objectionId === oOther.json.id), '未被暂存修订触及的异议不进入受影响集合');
   booth = (await req('GET', '/api/booth', null, par)).json;
-  ok(JSON.stringify(booth.publishCheck.items).includes(String(oaid)),
-    'GET /api/booth 的 publishCheck 同样暴露待回应项（参与者只读可见）');
+  ok(booth.publishCheck === null,
+    '发布核对仅供记录员与复核员：参与者 booth.publishCheck 为 null，不暴露待回应项');
 
   // 无受影响异议时可按原规则发布：清空暂存后空发布仍按既有规则拒绝
   await req('POST', `/api/proposals/${q1.json.id}/reject`, { reason: '暂缓' }, rev);
@@ -664,6 +664,183 @@ async function main() {
     '零长度修订插入点恰在引用终点：半开区间不算触及，无需回应');
   const pub15b = await req('POST', '/api/publish', { note: '插入标点（未触及异议）' }, rev);
   ok(pub15b.status === 201, '无受影响异议：按原规则直接发布成功');
+
+  console.log('\n[段落保密：权限、未知段号与重复设置]');
+  const v15id = (await req('GET', '/api/booth', null, rec)).json.currentVersion.id;
+  ok(v15id >= 15, `保密用例起点为 v${v15id}`);
+  // 无权：参与者、记录员均不能设密/解密
+  await expectFail(req('POST', '/api/segments/3/conceal', {}, par), 403, '无权操作', '参与者尝试设密');
+  await expectFail(req('POST', '/api/segments/3/conceal', {}, rec), 403, '无权操作', '记录员尝试设密');
+  await expectFail(req('GET', '/api/segments/confidential', null, par), 403, '无权操作', '参与者尝试查看保密清单');
+  await expectFail(req('GET', '/api/publish-check', null, par), 403, '无权操作', '参与者访问发布核对');
+  // 未登录
+  await expectFail(req('POST', '/api/segments/3/conceal', {}), 401, '未登录', '未登录设密');
+  // 未知段号 → 404，不改变状态
+  await expectFail(req('POST', '/api/segments/999/conceal', {}, rev), 404, '不存在', '未知段号设密');
+  await expectFail(req('POST', '/api/segments/999/reveal', {}, rev), 404, '不存在', '未知段号解密');
+
+  console.log('\n[段落保密：设密留痕与参与者视图脱敏]');
+  // 第3段在 v15 含“2024年3月3日”等正文，且历史上有提议、异议、回应
+  const seg3before = (await req('GET', '/api/booth', null, rec)).json.segments.find((s) => s.seg === 3).text;
+  const con3 = await req('POST', '/api/segments/3/conceal', {}, rev);
+  assert.strictEqual(con3.status, 201, `设密返回 201: ${JSON.stringify(con3.json)}`);
+  ok(con3.json.log.seg === 3 && con3.json.log.action === 'conceal' &&
+     con3.json.log.before_status === 'normal' && con3.json.log.after_status === 'confidential' &&
+     con3.json.log.actor_user === 'reviewer',
+    '设密留痕：段号、操作人（reviewer）、时间与前后状态 normal→confidential');
+  // 重复设置 → 409，不改变状态
+  await expectFail(req('POST', '/api/segments/3/conceal', {}, rev), 409, '已经是保密', '重复设密');
+
+  let parBooth = (await req('GET', '/api/booth', null, par)).json;
+  ok(parBooth.confidentialSegs.includes(3), '参与者总览可见保密段号集合（含 3）');
+  const pSeg3 = parBooth.segments.find((s) => s.seg === 3);
+  ok(pSeg3.confidential === true && pSeg3.text === '【该段已保密】',
+    '参与者总览：保密段只见占位，不获得正文');
+  ok(pSeg3.text !== seg3before && !JSON.stringify(parBooth.segments).includes('2024年3月3日'),
+    '参与者总览任何段落都不泄露第3段正文');
+  const pPreview3 = parBooth.previewSegments.find((s) => s.seg === 3);
+  ok(pPreview3.confidential === true && pPreview3.text === '【该段已保密】',
+    '参与者：暂存预览中保密段同样为占位（不获得暂存预览）');
+  ok(parBooth.stage.every((p) => p.seg !== 3), '参与者：暂存区不包含保密段修订');
+  ok(parBooth.proposals.every((p) => p.seg !== 3), '参与者：提议列表不含保密段提议（含替换文字与依据）');
+  ok(!JSON.stringify(parBooth.proposals).includes('2024年3月3日') &&
+     !JSON.stringify(parBooth.proposals).includes('录音核对为3月3日'),
+    '参与者：提议原始摘录与依据均不泄露');
+  ok(parBooth.objections.every((o) => o.seg !== 3), '参与者：异议列表不含保密段异议（原文与说明）');
+  ok(!JSON.stringify(parBooth.objections).includes('日期异议：请复核员发布前说明') &&
+     !JSON.stringify(parBooth.objections).includes('应当是') &&
+     !JSON.stringify(parBooth.objections).includes('发布前临时新增异议') &&
+     !JSON.stringify(parBooth.objections).includes('2024年3月3日'),
+    '参与者：保密段异议原文快照与说明均不泄露（第3段内容）');
+  ok(parBooth.currentVersion.note === '' && parBooth.versions.every((v) => v.note === ''),
+    '参与者：总览与版本列表不显示版本备注');
+
+  // 工作人员视图不受影响：正文/提议/异议/备注照常
+  let revBooth = (await req('GET', '/api/booth', null, rev)).json;
+  const rSeg3 = revBooth.segments.find((s) => s.seg === 3);
+  ok(rSeg3.text === seg3before && !rSeg3.confidential, '复核员：保密段正文仍完整可见，原始数据不改写');
+  ok(revBooth.proposals.some((p) => p.seg === 3) && revBooth.objections.some((o) => o.seg === 3),
+    '复核员：保密段提议与异议照常可见，校订流程不变');
+  ok(revBooth.confidential.segments.some((s) => s.seg === 3) &&
+     revBooth.confidential.logs[0].seg === 3 && revBooth.confidential.logs[0].action === 'conceal',
+    '复核员：保密清单与变更留痕可查（操作人、时间、前后状态）');
+  const recBooth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(recBooth.segments.find((s) => s.seg === 3).text === seg3before &&
+     recBooth.confidential && recBooth.confidential.logs.length >= 1,
+    '记录员：正文可见且可只读查看保密留痕');
+
+  console.log('\n[段落保密：参与者历史版本视图脱敏（全部历史版本）]');
+  for (const vid of [1, 11, v15id]) {
+    const pv = (await req('GET', `/api/versions/${vid}`, null, par)).json;
+    const ps3 = pv.segments.find((s) => s.seg === 3);
+    ok(ps3.confidential === true && ps3.text === '【该段已保密】',
+      `参与者查看历史 v${vid}：第3段为保密占位`);
+    ok(pv.note === '', `参与者查看历史 v${vid}：不显示版本备注`);
+    ok(pv.decisions.every((d) => d.seg !== 3), `参与者 v${vid}：不提供保密段决议（提议/依据/摘录）`);
+    ok(pv.objections.every((o) => o.seg !== 3), `参与者 v${vid}：不提供保密段异议原文与说明`);
+    ok(pv.responses.every((r) => r.seg !== 3), `参与者 v${vid}：不提供保密段发布前回应`);
+    // 其他段不受影响
+    const other = pv.segments.find((s) => s.seg === 1);
+    ok(other && !other.confidential && other.text, `参与者 v${vid}：非保密段（第1段）正文照常可见`);
+    ok(pv.objections.some((o) => o.seg !== 3) === (pv.objections.length > 0),
+      `参与者 v${vid}：非保密段异议照常保留`);
+  }
+  // v11 的归档回应（对第3段异议 oA）对参与者不可见
+  const pv11par = (await req('GET', '/api/versions/11', null, par)).json;
+  ok(!JSON.stringify(pv11par.responses).includes('3月3日'),
+    '参与者 v11：第3段回应原文（含3月3日说明）不泄露');
+  // 工作人员历史视图：原始记录完全不改写
+  const pv11rev = (await req('GET', '/api/versions/11', null, rev)).json;
+  ok(pv11rev.note !== '' && pv11rev.segments.find((s) => s.seg === 3).text.includes('2024年3月3日'),
+    '复核员 v11：版本备注与第3段原文快照保持不变（保密不改写已发布版本）');
+  ok(pv11rev.responses.some((r) => r.seg === 3 && r.note.includes('3月3日')),
+    '复核员 v11：第3段回应只读归档照常可见');
+
+  console.log('\n[段落保密：参与者不得在保密段新建或重新定位异议]');
+  const seg3len = Array.from(parBooth.segments.find((s) => s.seg === 3).text).length; // 占位长度
+  // 以工作人员视角的真实长度构造范围，服务端仍应按角色拒绝（而非因范围问题拒绝）
+  const realLen3 = Array.from(seg3before).length;
+  await expectFail(req('POST', '/api/objections',
+    { seg: 3, start: 0, end: Math.min(2, realLen3), note: '保密段内新建异议' }, par),
+    403, '已保密', '参与者在保密段新建异议被拒绝');
+  // 参与者尝试把既有异议重定位到保密段（第3段）：拒绝；用一个参与者拥有的待重定位异议
+  // 先制造一个属于 par 的待重定位异议
+  const seg5now = (await req('GET', '/api/booth', null, rec)).json.segments.find((s) => s.seg === 5).text;
+  // 取第5段开头的稳定文字作为异议锚点，再用覆盖该锚点的修订使其待重新定位
+  const iHead5 = 0;
+  const headText5 = Array.from(seg5now).slice(0, 3).join('');
+  const oRel = await req('POST', '/api/objections',
+    { seg: 5, start: iHead5, end: iHead5 + Array.from(headText5).length, note: '用于保密重定位测试的异议' }, par);
+  assert.strictEqual(oRel.status, 201);
+  const rRelEdit = await req('POST', '/api/proposals',
+    { seg: 5, start: iHead5, end: iHead5 + Array.from(headText5).length, replacement: '【' + headText5 + '】', basis: '加标记' }, rec);
+  const adRel = await req('POST', `/api/proposals/${rRelEdit.json.id}/adopt`, {}, rev);
+  assert.strictEqual(adRel.status, 200, `采纳测试用修订失败: ${JSON.stringify(adRel.json)}`);
+  await clearGate(rev);
+  const pubRel = await req('POST', '/api/publish', { note: '制造待重定位异议' }, rev);
+  assert.strictEqual(pubRel.status, 201, `制造待重定位异议的发布失败: ${JSON.stringify(pubRel.json)}`);
+  const relBooth = (await req('GET', '/api/booth', null, par)).json;
+  const oRelNow = relBooth.objections.find((x) => x.id === oRel.json.id);
+  ok(oRelNow && oRelNow.anchor_status === 'needs_relocation', '测试前置：制造一条参与者的待重定位异议');
+  await expectFail(req('POST', `/api/objections/${oRel.json.id}/relocate`,
+    { seg: 3, start: 0, end: Math.min(2, realLen3) }, par),
+    403, '已保密', '参与者把异议重新定位到保密段被拒绝');
+  // 重定位到非保密段仍可成功（既有流程保持）：定位到修订后第5段开头的新文字
+  const seg5after = (await req('GET', '/api/booth', null, rec)).json.segments.find((s) => s.seg === 5).text;
+  const iSec2 = 0;
+  const rloc = await req('POST', `/api/objections/${oRel.json.id}/relocate`,
+    { seg: 5, start: iSec2, end: iSec2 + 3 }, par);
+  ok(rloc.status === 200, `参与者在非保密段重新定位成功（既有重定位流程不变）：${seg5after.slice(0, 6)}`);
+
+  console.log('\n[段落保密：工作人员校订与发布流程不受影响]');
+  // 复核员仍可对保密段上的提议走采纳/驳回/发布；记录员仍可在保密段提议
+  const seg3cur = (await req('GET', '/api/booth', null, rec)).json.segments.find((s) => s.seg === 3).text;
+  const iPub = cpIndexOf(seg3cur, '李四'); // 第3段含“被申请人李四辩称”
+  const pSec = await req('POST', '/api/proposals',
+    { seg: 3, start: iPub, end: iPub + 2, replacement: '李四（化名）', basis: '匿名化' }, rec);
+  assert.strictEqual(pSec.status, 201, '记录员在保密段仍可提交提议');
+  const adSec = await req('POST', `/api/proposals/${pSec.json.id}/adopt`, {}, rev);
+  ok(adSec.status === 200 && !adSec.json.markedConflict, '复核员在保密段仍可采纳提议');
+  // 触及异议时回应门槛仍生效（工作人员内部流程）
+  await clearGate(rev);
+  const pubSec = await req('POST', '/api/publish', { note: '保密段匿名化修订' }, rev);
+  ok(pubSec.status === 201, '保密段修订按既有回应/发布规则发布成功');
+  const newVid = pubSec.json.versionId;
+  // 发布后参与者查看新版本：保密段依旧占位，版本备注仍不显示
+  const pvNew = (await req('GET', `/api/versions/${newVid}`, null, par)).json;
+  ok(pvNew.segments.find((s) => s.seg === 3).text === '【该段已保密】' && pvNew.note === '',
+    `发布 v${newVid} 后：参与者见占位且不见版本备注；保密以段号为准立即作用于新版本`);
+  const pvNewRev = (await req('GET', `/api/versions/${newVid}`, null, rev)).json;
+  ok(pvNewRev.segments.find((s) => s.seg === 3).text.includes('李四（化名）'),
+    `复核员 v${newVid}：保密段修订正文照常落版`);
+
+  console.log('\n[段落保密：解除后参与者重新可见，留痕完整]');
+  // 重复解除（当前仍保密中，先测对非保密段的重复解除：用第1段）
+  await expectFail(req('POST', '/api/segments/1/reveal', {}, rev), 409, '不是保密', '对非保密段解除被拒绝');
+  const rev3 = await req('POST', '/api/segments/3/reveal', {}, rev);
+  assert.strictEqual(rev3.status, 200, `解密返回 200: ${JSON.stringify(rev3.json)}`);
+  ok(rev3.json.log.seg === 3 && rev3.json.log.action === 'reveal' &&
+     rev3.json.log.before_status === 'confidential' && rev3.json.log.after_status === 'normal' &&
+     rev3.json.log.actor_user === 'reviewer',
+    '解密留痕：操作人、时间与前后状态 confidential→normal');
+  await expectFail(req('POST', '/api/segments/3/reveal', {}, rev), 409, '不是保密', '重复解密被拒绝');
+  await expectFail(req('POST', '/api/segments/999/reveal', {}, rev), 404, '不存在', '未知段号解密');
+  parBooth = (await req('GET', '/api/booth', null, par)).json;
+  const parSeg3after = parBooth.segments.find((s) => s.seg === 3);
+  ok(!parSeg3after.confidential && parSeg3after.text.includes('李四（化名）'),
+    '解除后：参与者重新可见保密段当前正文');
+  ok(parBooth.proposals.some((p) => p.seg === 3) && parBooth.objections.some((o) => o.seg === 3),
+    '解除后：参与者重新可见该段提议与异议');
+  const pvAfter = (await req('GET', '/api/versions/1', null, par)).json;
+  ok(pvAfter.segments.find((s) => s.seg === 3).text.includes('2024年3月2日'),
+    '解除后：参与者历史版本 v1 第3段原文重新可见（历史记录本身从未被改写）');
+  // 留痕列表按时间倒序，含 conceal 与 reveal 两条
+  const logList = (await req('GET', '/api/segments/confidential', null, rev)).json;
+  const seg3logs = logList.logs.filter((l) => l.seg === 3);
+  ok(seg3logs.length >= 2 && seg3logs[0].action === 'reveal' &&
+     seg3logs.some((l) => l.action === 'conceal') &&
+     seg3logs.every((l) => l.actorName && l.createdAt && l.beforeStatus && l.afterStatus),
+    '保密清单：设密与解除两条留痕均可追溯（操作人、时间、前后状态齐全）');
 
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);

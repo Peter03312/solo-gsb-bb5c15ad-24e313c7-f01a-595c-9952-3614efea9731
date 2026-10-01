@@ -16,6 +16,9 @@ let tab = 'proposals';
 let viewMode = 'base';
 let currentSelection = null; // { seg, start, end, excerpt }
 
+const isStaff = () => me && me.role !== 'participant';
+const isConfidentialSeg = (seg) => !!(booth && booth.confidentialSegs && booth.confidentialSegs.includes(seg));
+
 // ---------- API ----------
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -141,13 +144,16 @@ function render() {
   } else {
     $('#import-box').classList.add('hidden');
     $('#doc-title').textContent = booth.title;
-    $('#ver-line').textContent = `当前版本 v${booth.currentVersion.id} · ${booth.currentVersion.note} · ${booth.currentVersion.createdAt} UTC`;
+    $('#ver-line').textContent = `当前版本 v${booth.currentVersion.id}` +
+      (isStaff() && booth.currentVersion.note ? ` · ${booth.currentVersion.note}` : '') +
+      ` · ${booth.currentVersion.createdAt} UTC`;
     renderPaper();
     renderPublishBar();
   }
   renderTabs();
   renderProposals();
   renderObjections();
+  renderSecret();
   renderVersions();
 }
 
@@ -178,19 +184,63 @@ function renderPaper() {
 
   for (const seg of list) {
     const row = document.createElement('div');
-    row.className = 'seg';
+    row.className = 'seg' + (seg.confidential ? ' seg-confidential' : '');
     const no = document.createElement('div');
     no.className = 'seg-no';
     no.textContent = seg.seg;
     const body = document.createElement('div');
-    body.className = 'seg-body' + (viewMode === 'base' ? ' selectable' : '');
+    // 保密段：参与者只见占位（不可选择）；工作人员正文可正常校订，但以视觉标识提示该段当前保密
+    body.className = 'seg-body' + (viewMode === 'base' && !seg.confidential ? ' selectable' : '');
     body.dataset.seg = seg.seg;
 
-    const segMarks = viewMode === 'preview' ? buildPreviewMarks(seg.seg) : collectSegMarks(seg.seg);
-    renderMarkedText(body, seg.text, segMarks);
+    if (seg.confidential) {
+      const ph = document.createElement('div');
+      ph.className = 'confidential-placeholder';
+      ph.textContent = '🔒 该段已保密（参与者不可见正文、提议与异议）';
+      body.appendChild(ph);
+    } else {
+      const segMarks = viewMode === 'preview' ? buildPreviewMarks(seg.seg) : collectSegMarks(seg.seg);
+      renderMarkedText(body, seg.text, segMarks);
+    }
+    // 复核员可在任意视图直接设密/解密；记录员只见状态标识
+    if (isStaff()) {
+      const ctrl = document.createElement('div');
+      ctrl.className = 'seg-secret-ctrl';
+      if (me.role === 'reviewer') {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'btn small ' + (isConfidentialSeg(seg.seg) ? '' : 'secret-on');
+        b.textContent = isConfidentialSeg(seg.seg) ? '解除保密' : '设为保密';
+        b.addEventListener('mousedown', (e) => e.preventDefault());
+        b.addEventListener('click', () => toggleConfidential(seg.seg));
+        ctrl.appendChild(b);
+      } else {
+        const tag = document.createElement('span');
+        tag.className = 'secret-tag';
+        tag.textContent = isConfidentialSeg(seg.seg) ? '🔒 保密中' : '';
+        if (!isConfidentialSeg(seg.seg)) tag.classList.add('hidden');
+        ctrl.appendChild(tag);
+      }
+      body.appendChild(ctrl);
+    }
     row.appendChild(no);
     row.appendChild(body);
     paper.appendChild(row);
+  }
+}
+
+// 复核员设密/解密：失败（未知段号、重复设置、无权）由服务端拒绝，不改本地状态，提示由 reload 复位
+async function toggleConfidential(seg) {
+  const nowHidden = isConfidentialSeg(seg);
+  const action = nowHidden ? 'reveal' : 'conceal';
+  const verb = nowHidden ? '解除第 ' + seg + ' 段保密' : '将第 ' + seg + ' 段设为保密';
+  if (!window.confirm(`确认${verb}？\n保密以段号为准，立即作用于当前及全部历史版本的参与者视图；变更将留存操作人、时间与前后状态。`)) return;
+  try {
+    const r = await api(`/api/segments/${seg}/${action}`, { method: 'POST' });
+    await reload();
+    toast(`${verb}成功（留痕 #${r.log.id}，${r.log.before_status} → ${r.log.after_status}）`, 'success');
+  } catch (err) {
+    toast(err.message, 'error');
   }
 }
 
@@ -325,6 +375,10 @@ function onSelection() {
     return;
   }
   const seg = parseInt(aBody.dataset.seg, 10);
+  if (!isStaff() && isConfidentialSeg(seg)) {
+    toast('该段已保密：参与者不可见正文，也不能在此段提出或重新定位异议', 'error');
+    return;
+  }
   const s = cpOffsetInSeg(aBody, range.startContainer, range.startOffset);
   const en = cpOffsetInSeg(aBody, range.endContainer, range.endOffset);
   if (s == null || en == null || s === en) return;
@@ -616,16 +670,22 @@ function renderTabs() {
   $$('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $('#panel-proposals').classList.toggle('hidden', tab !== 'proposals');
   $('#panel-objections').classList.toggle('hidden', tab !== 'objections');
+  $('#panel-secret').classList.toggle('hidden', tab !== 'secret');
   $('#panel-versions').classList.toggle('hidden', tab !== 'versions');
   if (booth && booth.initialized) {
     const pending = booth.proposals.filter((p) => p.status === 'pending' && p.base_ver === booth.currentVersion.id).length;
     const relo = booth.objections.filter((o) => o.anchor_status === 'needs_relocation').length;
-    const respondPending = (booth.publishCheck && booth.publishCheck.items || []).filter((x) => !x.satisfied).length;
+    // 发布核对仅供记录员与复核员：参与者的 publishCheck 为 null，不显示待回应计数
+    const respondPending = isStaff()
+      ? (booth.publishCheck && booth.publishCheck.items || []).filter((x) => !x.satisfied).length
+      : 0;
     setBadge('badge-proposals', pending);
     setBadge('badge-objections', relo + respondPending);
+    setBadge('badge-secret', (booth.confidentialSegs || []).length);
   } else {
     setBadge('badge-proposals', 0);
     setBadge('badge-objections', 0);
+    setBadge('badge-secret', 0);
   }
 }
 function setBadge(id, n) {
@@ -746,6 +806,65 @@ function renderObjections() {
     b.addEventListener('click', () => openRespondForm(parseInt(b.dataset.respond, 10))));
 }
 
+// ---------- 侧栏：段落保密 ----------
+function renderSecret() {
+  const panel = $('#panel-secret');
+  if (!isStaff()) {
+    // 参与者：只显示当前保密段号（正文及相关提议/异议均不可见），无操作入口
+    if (!booth || !booth.initialized) {
+      panel.innerHTML = '<div class="empty">尚无文档。</div>';
+      return;
+    }
+    const segs = booth.confidentialSegs || [];
+    panel.innerHTML = segs.length
+      ? `<div class="empty">以下段号当前已保密，仅显示保密占位：<br/><b>${segs.map((s) => `第 ${s} 段`).join('、')}</b></div>`
+      : '<div class="empty">当前没有保密段。</div>';
+    return;
+  }
+  if (!booth || !booth.initialized) { panel.innerHTML = '<div class="empty">尚无文档。</div>'; return; }
+
+  const info = booth.confidential || { segments: [], logs: [] };
+  const segOptions = booth.segments.map((s) => s.seg);
+  panel.innerHTML = `
+    <div class="secret-intro muted">
+      复核员可按段号设密/解密。保密立即作用于当前及<b>全部历史版本</b>的参与者视图（仅显示占位），
+      不改写已发布版本、提议、异议与回应原始记录；参与者不得在保密段新建或重新定位异议。
+    </div>
+    ${me.role === 'reviewer' ? `
+    <div class="card secret-form">
+      <label>段号
+        <select id="sec-seg">${segOptions.map((s) => `<option value="${s}">第 ${s} 段${(booth.confidentialSegs || []).includes(s) ? '（保密中）' : ''}</option>`).join('')}</select>
+      </label>
+      <div class="card-actions">
+        <button class="btn small primary" id="sec-conceal">设为保密</button>
+        <button class="btn small danger" id="sec-reveal">解除保密</button>
+      </div>
+    </div>` : ''}
+    <h4 class="secret-h">当前保密段（${info.segments.length}）</h4>
+    ${info.segments.length ? info.segments.map((s) => `
+      <div class="card">
+        <div class="card-head">
+          <span class="card-id">第 ${s.seg} 段 🔒</span>
+          <span class="card-meta">${s.createdAt} UTC</span>
+        </div>
+        <div class="card-meta">设密操作人：${esc(s.createdByName)}（${esc(s.createdByUser)}）</div>
+      </div>`).join('') : '<div class="empty">当前没有保密段。</div>'}
+    <h4 class="secret-h">变更留痕（${info.logs.length}）</h4>
+    ${info.logs.length ? info.logs.map((l) => `
+      <div class="decision-item ${l.action === 'conceal' ? 't-conflict' : 't-adopt'}">
+        <b>${l.action === 'conceal' ? '设为保密' : '解除保密'}</b> · 第 ${l.seg} 段
+        · ${l.beforeStatus === 'confidential' ? '保密' : '正常'} → ${l.afterStatus === 'confidential' ? '保密' : '正常'}
+        <div class="card-meta">${esc(l.actorName)}（${esc(l.actorUser)}）· ${l.createdAt} UTC · 留痕 #${l.id}</div>
+      </div>`).join('') : '<div class="empty">尚无保密变更记录。</div>'}`;
+
+  const concealBtn = $('#sec-conceal');
+  if (concealBtn) concealBtn.addEventListener('click', () =>
+    toggleConfidential(parseInt($('#sec-seg').value, 10)));
+  const revealBtn = $('#sec-reveal');
+  if (revealBtn) revealBtn.addEventListener('click', () =>
+    toggleConfidential(parseInt($('#sec-seg').value, 10)));
+}
+
 // ---------- 侧栏：版本 ----------
 function renderVersions() {
   const panel = $('#panel-versions');
@@ -754,7 +873,7 @@ function renderVersions() {
     <div class="ver-card">
       <div>
         <div class="vid">v${v.id} ${v.id === booth.currentVersion.id ? '<span class="tag tag-published">当前</span>' : ''}</div>
-        <div class="card-meta">${esc(v.note)} · ${esc(v.creator_name || '系统')} · ${v.created_at} UTC</div>
+        <div class="card-meta">${v.note ? `${esc(v.note)} · ` : ''}${esc(v.creator_name || '系统')} · ${v.created_at} UTC</div>
       </div>
       <button class="btn small" data-ver="${v.id}">只读查看</button>
     </div>`).join('');
@@ -770,14 +889,16 @@ async function openVersion(id) {
         <h3>版本 v${v.id}（不可变快照）</h3>
         <button class="btn small" data-close>关闭</button>
       </div>
-      <div class="v-meta">${esc(v.note)} · ${v.created_at} UTC</div>
+      <div class="v-meta">${esc(v.note || '')}${v.note ? ` · ${v.created_at} UTC` : ''}${!v.note && isStaff() ? `${v.created_at} UTC` : ''}</div>
       <div class="v-section">
         <h4>正文</h4>
         <div class="paper" style="padding:16px 20px;min-height:auto">
           ${v.segments.map((s) => `
-            <div class="seg">
+            <div class="seg${s.confidential ? ' seg-confidential' : ''}">
               <div class="seg-no">${s.seg}</div>
-              <div class="seg-body">${esc(s.text)}</div>
+              <div class="seg-body">${s.confidential
+                ? '<span class="confidential-placeholder">🔒 该段已保密（参与者不可见正文、提议与异议）</span>'
+                : esc(s.text)}</div>
             </div>`).join('')}
         </div>
       </div>

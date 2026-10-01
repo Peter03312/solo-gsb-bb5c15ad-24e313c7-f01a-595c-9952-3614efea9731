@@ -3,7 +3,8 @@
 供听证会**记录员**与**复核员**（及**参与者**）使用的网页校订台：导入带段号的 UTF-8 逐字稿后，
 记录员可在段内选定字符范围提交“替换文字 + 依据”的修订提议；复核员可采纳、驳回提议并发布。
 发布形成不可变版本；因发布而过期的提议可由记录员**续提**（按逐次发布的修订把原选区换算到当前正文后重提）；
-参与者可对原文范围留下异议引用，修订使被引文字消失时保留原文快照并提示重新定位。
+参与者可对原文范围留下异议引用，修订使被引文字消失时保留原文快照并提示重新定位；
+复核员可**按段号将段落设为保密/解除保密**（留痕操作人、时间与前后状态），保密立即作用于当前及全部历史版本的参与者视图但不改写原始记录。
 
 技术栈：Node.js（Express）+ SQLite（better-sqlite3）+ 无构建浏览器原生前端。
 
@@ -43,8 +44,8 @@ SQLite 数据库保存在命名卷 `hearing-revision-data`（容器内 `/data/he
 | 角色 | 用户名 | 密码 | 可执行操作 |
 | --- | --- | --- | --- |
 | 记录员 | `recorder` | `recorder123` | 导入逐字稿、提交修订提议 |
-| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议 |
-| 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议 |
+| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议、按段号设密/解密 |
+| 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议（保密段除外） |
 
 种子账户仅在数据库用户表为空时创建；可通过环境变量覆盖用户名与密码（见下文配置）。
 
@@ -139,6 +140,17 @@ npm test
      **“待重新定位”**警示，原文快照继续保留；可由提出者或复核员在当前版本上手动重新定位并留痕。
 7. **版本查看**：“版本”面板可只读查看任一历史版本的**正文、决议（采纳/驳回/冲突/续提/发布留痕）、
    异议与发布前异议回应**；历史版本内容不随后续发布改变。
+8. **段落保密（复核员按段号设密/解密）**：复核员可在正文每段的“设为保密/解除保密”按钮或右侧“保密”面板按段号操作。
+   - 每次变更均**留存操作人、操作时间与前后状态**（normal ⇄ confidential），可在“保密”面板或
+     `GET /api/segments/confidential` 追溯。
+   - **未知段号**返回 404、**重复设置/重复解除**返回 409、**无权操作**（非复核员）返回 403，均不改变任何状态。
+   - 保密**以段号为准**，立即作用于**当前及全部历史版本的参与者视图**；**不改写**任何已发布版本原文、
+     提议、异议与回应的原始记录（工作人员视图与库内数据始终完整）。
+   - 参与者查看总览及任一历史版本时，保密段只显示占位 `【该段已保密】`：不获得该段**正文、暂存（发布）预览、
+     提议及依据、异议原文与说明、发布前回应和决议**；发布核对（publish-check）仅供记录员与复核员，
+     参与者也**不显示版本备注**（当前版本行、版本列表与历史版本视图均不返回备注）。
+   - 参与者**不得在保密段新建或重新定位异议**（403 明确拒绝）；保密前已存在的相关异议不删除、不改写，
+     仍由工作人员按原发布/回应/重定位规则处理。**解除保密后**参与者立即重新可见。
 
 所有失败场景（无权操作、非法字符范围、重复发布、重复导入、重复采纳/重定位等）均返回明确的
 HTTP 状态码与中文原因，且在数据库事务中执行——失败即回滚，不改变任何状态。
@@ -169,8 +181,11 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `POST /api/objections` | 登录用户 | 对原文范围提出异议 `{seg,start,end,note}` |
 | `POST /api/objections/:id/relocate` | 提出者或复核员 | 对“待重新定位”的异议手动重定位 |
 | `POST /api/objections/:id/respond` | 复核员 | 发布前对被暂存修订触及的异议填写非空回应 `{note}`；自动关联异议、触及提议、当前版本与暂存指纹。未被触及时返回 409 |
-| `GET /api/publish-check` | 登录用户 | 只读发布前核对：受影响异议、每条关联提议、回应绑定状态与失效原因（`missing` / `STAGE_CHANGED` / `ANCHOR_MOVED` / `PROPOSALS_CHANGED`）；`GET /api/booth` 的 `publishCheck` 字段内容相同 |
-| `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议/发布前异议回应） |
+| `GET /api/publish-check` | 记录员/复核员 | 只读发布前核对：受影响异议、每条关联提议、回应绑定状态与失效原因（`missing` / `STAGE_CHANGED` / `ANCHOR_MOVED` / `PROPOSALS_CHANGED`）；工作人员侧 `GET /api/booth` 的 `publishCheck` 字段内容相同（参与者为 `null`） |
+| `POST /api/segments/:seg/conceal` | 复核员 | 按段号将段落设为保密；未知段号 404、重复设置 409，成功返回含操作人/时间/前后状态的留痕记录 |
+| `POST /api/segments/:seg/reveal` | 复核员 | 按段号解除保密；未知段号 404、当前非保密（重复解除）409，返回留痕记录 |
+| `GET /api/segments/confidential` | 记录员/复核员 | 当前保密段清单与全部设密/解密变更留痕（操作人、时间、前后状态）；参与者 403 |
+| `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议/发布前异议回应）；参与者视图对当前保密段只给占位并剔除该段提议/异议/回应/决议，且不返回版本备注 |
 
 ### 发布前异议回应调用示例（curl）
 
@@ -208,6 +223,49 @@ curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/publish \
 > 满足 `anchor.start ≤ 插入点 < anchor.end` 即触及（点在引用起点算、在终点不算）。
 > 采纳/驳回提议、重新定位异议后须重新核对；重新回应同一异议会取代其未发布旧回应（旧回应留痕）。
 
+### 段落保密调用示例（curl）
+
+保密以**段号**为准，立即作用于当前及全部历史版本的参与者视图，但不改写任何已发布版本、提议、
+异议与回应原始记录；仅复核员可设密/解密。
+
+```bash
+# 1) 复核员登录（仅复核员有权限；记录员/参与者返回 403）
+curl -i -c /tmp/rev.cookie -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"reviewer","password":"reviewer123"}'
+
+# 2) 将第 3 段设为保密（段号在路径中）
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/segments/3/conceal
+# {
+#   "ok": true,
+#   "log": { "id": 1, "seg": 3, "action": "conceal",
+#            "before_status": "normal", "after_status": "confidential",
+#            "created_at": "2026-10-01 00:15:54",
+#            "actor_name": "复核员", "actor_user": "reviewer" } }
+
+# 3) 失败场景：未知段号 404；重复设密 409；均不改变状态
+#    {"error":"段号 99 不存在：当前版本 v2 中没有该段，设置保密被拒绝","code":"NOT_FOUND"}
+#    {"error":"第 3 段已经是保密状态，请勿重复设置","code":"ALREADY_CONFIDENTIAL"}
+
+# 4) 参与者随后查看总览与历史版本：该段只有占位，且无该段提议/异议/回应、无版本备注
+curl -s -b /tmp/par.cookie http://localhost:3000/api/booth
+#   ... "segments":[..., {"seg":3,"text":"【该段已保密】","confidential":true}, ...],
+#       "publishCheck": null, "confidentialSegs":[3], 版本 note 均为 ""
+
+# 参与者在保密段新建/重新定位异议 → 403
+curl -s -b /tmp/par.cookie -X POST http://localhost:3000/api/objections \
+  -H 'Content-Type: application/json' -d '{"seg":3,"start":0,"end":2,"note":"x"}'
+# {"error":"无权操作：第 3 段已保密，参与者不能在该段提出异议","code":"FORBIDDEN"}
+
+# 5) 工作人员可随时查看当前保密段与全部变更留痕
+curl -s -b /tmp/rev.cookie http://localhost:3000/api/segments/confidential
+
+# 6) 解除保密：参与者立即重新可见（历史原始记录从未被改写）
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/segments/3/reveal
+# {"ok":true,"log":{"id":2,"seg":3,"action":"reveal",
+#   "before_status":"confidential","after_status":"normal", ...}}
+```
+
 ---
 
 ## 六、数据模型（SQLite）
@@ -224,6 +282,11 @@ curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/publish \
   （`proposal_ids_json`）、回应时版本（`version_id`）、暂存区指纹（`stage_fingerprint`）与异议锚点快照；
   未发布草稿可被重新回应取代（`status='superseded'`，留痕保留），发布核对通过后写入
   `published_version_id` 随版只读归档。发布事务内重新核对绑定，任一缺失/失效即整体回滚。
+- `segment_confidential`：当前处于保密状态的**段号**清单（一行一段，不随版本变化）。
+  保密以段号为准、只影响参与者视图的**呈现**，不复制、不改写任何版本快照。
+- `segment_confidential_logs`：段落保密变更审计流（不可变追加）。每次设密（`conceal`）/
+  解除（`reveal`）都记录段号、操作人（`actor_id`）、操作时间与前后状态
+  （`before_status` / `after_status`：normal ⇄ confidential）。
 
 ---
 
@@ -240,7 +303,7 @@ curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/publish \
 │   ├── server.js            # Express 路由与错误出口
 │   ├── auth.js              # Cookie 会话与角色鉴权
 │   ├── db.js                # SQLite 连接、建表、种子账户
-│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图
+│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/段落保密
 │   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算
 ├── public                   # 浏览器前端（原生 HTML/CSS/JS，无构建步骤）
 │   ├── index.html

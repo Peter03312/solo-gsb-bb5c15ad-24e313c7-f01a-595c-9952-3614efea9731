@@ -49,8 +49,8 @@ app.post('/api/logout', wrap((req, res) => {
 app.get('/api/me', (req, res) => res.json({ user: publicUser(req.user) }));
 
 // ---------- 校订台总览 ----------
-app.get('/api/booth', requireAuth, wrap((_req, res) => {
-  res.json(store.boothView(db));
+app.get('/api/booth', requireAuth, wrap((req, res) => {
+  res.json(store.boothView(db, req.user));
 }));
 
 // ---------- 导入（记录员，仅一次） ----------
@@ -113,8 +113,25 @@ app.post('/api/objections/:id/respond', requireRole('reviewer'), wrap((req, res)
   res.status(201).json({ ok: true, ...result });
 }));
 
-// 发布前核对（只读）：待回应异议、关联提议与回应状态/失效原因；与 GET /api/booth 的 publishCheck 相同
-app.get('/api/publish-check', requireAuth, wrap((_req, res) => {
+// ---------- 段落保密（复核员按段号设密/解密，留痕操作人、时间与前后状态） ----------
+// 段号以路径为准；未知段号、重复设置、无权操作均在 store 内明确拒绝且不改变状态。
+app.post('/api/segments/:seg/conceal', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.concealSegment(db, req.user, { seg: parseInt(req.params.seg, 10) });
+  res.status(201).json(result);
+}));
+
+app.post('/api/segments/:seg/reveal', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.revealSegment(db, req.user, { seg: parseInt(req.params.seg, 10) });
+  res.json(result);
+}));
+
+// 保密状态与变更留痕只读列表（记录员/复核员；参与者无权查看，其总览只返回保密段号集合）
+app.get('/api/segments/confidential', requireRole('reviewer', 'recordist'), wrap((_req, res) => {
+  res.json(store.confidentialListView(db));
+}));
+
+// 发布前核对（只读）：仅记录员与复核员可查看；与 booth 视图中工作人员侧的 publishCheck 相同
+app.get('/api/publish-check', requireRole('reviewer', 'recordist'), wrap((_req, res) => {
   const ver = store.latestVersion(db);
   if (!ver || !store.getDoc(db)) {
     return res.json({ initialized: false, versionId: null, stageFp: '', items: [] });
@@ -124,7 +141,7 @@ app.get('/api/publish-check', requireAuth, wrap((_req, res) => {
 
 // ---------- 不可变版本视图 ----------
 app.get('/api/versions/:id', requireAuth, wrap((req, res) => {
-  res.json(store.versionView(db, parseInt(req.params.id, 10)));
+  res.json(store.versionView(db, parseInt(req.params.id, 10), req.user));
 }));
 
 // ---------- 静态前端 ----------

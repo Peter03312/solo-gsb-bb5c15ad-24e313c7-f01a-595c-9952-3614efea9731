@@ -153,6 +153,26 @@ function initSchema(db) {
   CREATE INDEX IF NOT EXISTS idx_decisions_version ON decisions(version_id);
   CREATE INDEX IF NOT EXISTS idx_anchors_version ON objection_anchors(version_id);
   CREATE INDEX IF NOT EXISTS idx_responses_objection ON objection_responses(objection_id, status);
+
+  -- 段落保密：保密以段号为准，一行一个当前处于保密状态的段；
+  -- 立即作用于当前及全部历史版本的参与者视图，但不改写任何已发布版本原文。
+  CREATE TABLE IF NOT EXISTS segment_confidential (
+    seg        INTEGER PRIMARY KEY,
+    created_by INTEGER NOT NULL REFERENCES users(id),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  -- 段落保密变更审计流（不可变追加）：设为保密 / 解除保密均记录操作人、时间与前后状态
+  CREATE TABLE IF NOT EXISTS segment_confidential_logs (
+    id     INTEGER PRIMARY KEY,
+    seg    INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('conceal','reveal')),
+    actor_id INTEGER NOT NULL REFERENCES users(id),
+    before_status TEXT NOT NULL CHECK (before_status IN ('normal','confidential')),
+    after_status  TEXT NOT NULL CHECK (after_status  IN ('normal','confidential')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_seclogs_seg ON segment_confidential_logs(seg, id);
   `);
 
   // 既有数据库的轻量迁移：补充续提所需列，并按冲突原因文本回填类别
