@@ -86,6 +86,7 @@ async function enterApp() {
   $('#login-view').classList.add('hidden');
   $('#app-view').classList.remove('hidden');
   $('#user-info').textContent = `${me.displayName}（${roleLabel(me.role)}）@${me.username}`;
+  $('#secret-logs-btn').style.display = me.role === 'reviewer' ? '' : 'none';
   await reload();
 }
 
@@ -116,6 +117,28 @@ $('#logout-btn').addEventListener('click', async () => {
 });
 
 $('#refresh-btn').addEventListener('click', reload);
+$('#secret-logs-btn').addEventListener('click', openSecretLogs);
+$('#secret-logs-btn').style.display = 'none'; // 仅复核员可见（登录后按角色显示）
+
+// ---------- 段级保密留痕（复核员） ----------
+const SECRET_ACTION_LABEL = { classify: '设为保密', declassify: '解除保密' };
+async function openSecretLogs() {
+  try {
+    const data = await api('/api/secret-logs');
+    const logs = data.logs || [];
+    openModal(`
+      <h3>保密变更留痕</h3>
+      <p class="muted">保密以段号为准，立即作用于当前及全部历史版本的参与者视图；不改写已发布版本、提议、异议与回应原始记录。</p>
+      ${logs.length ? `<div class="secret-log-list">${logs.map((l) => `
+        <div class="decision-item ${l.action === 'classify' ? 't-conflict' : 't-adopt'}">
+          <b>第 ${l.seg} 段 · ${SECRET_ACTION_LABEL[l.action] || l.action}</b>
+          （${l.previous_state} → ${l.new_state}）
+          <div class="card-meta">${esc(l.actor_name)}（${esc(l.actor_user)}）· ${l.created_at} UTC · 留痕 #${l.id}</div>
+        </div>`).join('')}</div>`
+      : '<div class="empty">尚无保密变更记录。</div>'}
+      <div class="actions"><button class="btn" data-close>关闭</button></div>`);
+  } catch (err) { toast(err.message, 'error'); }
+}
 
 async function reload() {
   try {
@@ -141,7 +164,15 @@ function render() {
   } else {
     $('#import-box').classList.add('hidden');
     $('#doc-title').textContent = booth.title;
-    $('#ver-line').textContent = `当前版本 v${booth.currentVersion.id} · ${booth.currentVersion.note} · ${booth.currentVersion.createdAt} UTC`;
+    // 发布预览属工作人员校订环节：参与者不可切换（总览中始终为当前已发布正文）
+    $('#view-preview').style.display = me.role === 'participant' ? 'none' : '';
+    if (me.role === 'participant' && viewMode === 'preview') {
+      viewMode = 'base';
+      syncViewToggle();
+    }
+    $('#ver-line').textContent = booth.currentVersion.note
+      ? `当前版本 v${booth.currentVersion.id} · ${booth.currentVersion.note} · ${booth.currentVersion.createdAt} UTC`
+      : `当前版本 v${booth.currentVersion.id} · ${booth.currentVersion.createdAt} UTC`;
     renderPaper();
     renderPublishBar();
   }
@@ -178,20 +209,62 @@ function renderPaper() {
 
   for (const seg of list) {
     const row = document.createElement('div');
-    row.className = 'seg';
+    row.className = 'seg' + (seg.secret ? ' is-secret' : '');
     const no = document.createElement('div');
     no.className = 'seg-no';
     no.textContent = seg.seg;
+    if (seg.secret) no.classList.add('seg-no-secret');
     const body = document.createElement('div');
     body.className = 'seg-body' + (viewMode === 'base' ? ' selectable' : '');
     body.dataset.seg = seg.seg;
 
-    const segMarks = viewMode === 'preview' ? buildPreviewMarks(seg.seg) : collectSegMarks(seg.seg);
-    renderMarkedText(body, seg.text, segMarks);
+    if (seg.secret) {
+      // 参与者视角：保密段只渲染占位，不叠加任何标记（提议/异议均已被服务端过滤）
+      const ph = document.createElement('div');
+      ph.className = 'secret-placeholder';
+      ph.textContent = '🔒 ' + seg.text;
+      body.appendChild(ph);
+    } else {
+      const segMarks = viewMode === 'preview' ? buildPreviewMarks(seg.seg) : collectSegMarks(seg.seg);
+      renderMarkedText(body, seg.text, segMarks);
+      // 复核员：段号旁保密开关；工作人员始终可见真实正文
+      if (me.role === 'reviewer') {
+        const btn = document.createElement('button');
+        btn.className = 'btn tiny secret-toggle';
+        btn.textContent = isSecret(seg.seg) ? '解除保密' : '设为保密';
+        btn.title = '按段号保密，立即作用于当前及全部历史版本的参与者视图';
+        btn.addEventListener('mousedown', (e) => e.preventDefault());
+        btn.addEventListener('click', () => toggleSecret(seg.seg));
+        body.appendChild(btn);
+      } else if (isSecret(seg.seg)) {
+        const tag = document.createElement('span');
+        tag.className = 'secret-tag';
+        tag.textContent = '🔒 保密段（工作人员可见）';
+        body.appendChild(tag);
+      }
+    }
     row.appendChild(no);
     row.appendChild(body);
     paper.appendChild(row);
   }
+}
+
+// 段号是否在当前保密集合中（工作人员视角的真实正文用）
+function isSecret(seg) {
+  return !!(booth && booth.secretSegs && booth.secretSegs.includes(seg));
+}
+
+async function toggleSecret(seg) {
+  const secret = !isSecret(seg);
+  if (!window.confirm(`确认将第 ${seg} 段${secret ? '设为保密' : '解除保密'}？\n` +
+      (secret
+        ? '立即作用于当前及全部历史版本的参与者视图：参与者只看到保密占位，不获得正文、暂存预览、提议及依据、异议、回应与决议，且不能在该段新建或重新定位异议。'
+        : '解除后参与者将重新看到该段内容与相关记录。'))) return;
+  try {
+    const r = await api(`/api/segments/${seg}/${secret ? 'secret' : 'unsecret'}`, { method: 'POST' });
+    await reload();
+    toast(`第 ${seg} 段已${secret ? '设为保密' : '解除保密'}（留痕 #${r.logId}：${r.previousState} → ${r.newState}）`, 'success');
+  } catch (err) { toast(err.message, 'error'); }
 }
 
 function collectSegMarks(seg) {
@@ -325,6 +398,8 @@ function onSelection() {
     return;
   }
   const seg = parseInt(aBody.dataset.seg, 10);
+  const segObj = (booth.segments || []).find((x) => x.seg === seg);
+  if (segObj && segObj.secret) return; // 参与者视角的保密占位不可选择（服务端同样拒绝）
   const s = cpOffsetInSeg(aBody, range.startContainer, range.startOffset);
   const en = cpOffsetInSeg(aBody, range.endContainer, range.endOffset);
   if (s == null || en == null || s === en) return;
@@ -754,7 +829,7 @@ function renderVersions() {
     <div class="ver-card">
       <div>
         <div class="vid">v${v.id} ${v.id === booth.currentVersion.id ? '<span class="tag tag-published">当前</span>' : ''}</div>
-        <div class="card-meta">${esc(v.note)} · ${esc(v.creator_name || '系统')} · ${v.created_at} UTC</div>
+        <div class="card-meta">${esc(v.note) || '<span class="muted">版本备注仅工作人员可见</span>'} · ${esc(v.creator_name || '系统')} · ${v.created_at} UTC</div>
       </div>
       <button class="btn small" data-ver="${v.id}">只读查看</button>
     </div>`).join('');
@@ -770,14 +845,16 @@ async function openVersion(id) {
         <h3>版本 v${v.id}（不可变快照）</h3>
         <button class="btn small" data-close>关闭</button>
       </div>
-      <div class="v-meta">${esc(v.note)} · ${v.created_at} UTC</div>
+      <div class="v-meta">${esc(v.note) || '<span class="muted">（版本备注仅工作人员可见）</span>'} · ${v.created_at} UTC</div>
       <div class="v-section">
         <h4>正文</h4>
         <div class="paper" style="padding:16px 20px;min-height:auto">
           ${v.segments.map((s) => `
-            <div class="seg">
-              <div class="seg-no">${s.seg}</div>
-              <div class="seg-body">${esc(s.text)}</div>
+            <div class="seg${s.secret ? ' is-secret' : ''}">
+              <div class="seg-no${s.secret ? ' seg-no-secret' : ''}">${s.seg}</div>
+              <div class="seg-body">${s.secret
+                ? `<span class="secret-placeholder">🔒 ${esc(s.text)}</span>`
+                : esc(s.text)}</div>
             </div>`).join('')}
         </div>
       </div>

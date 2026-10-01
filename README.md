@@ -4,6 +4,8 @@
 记录员可在段内选定字符范围提交“替换文字 + 依据”的修订提议；复核员可采纳、驳回提议并发布。
 发布形成不可变版本；因发布而过期的提议可由记录员**续提**（按逐次发布的修订把原选区换算到当前正文后重提）；
 参与者可对原文范围留下异议引用，修订使被引文字消失时保留原文快照并提示重新定位。
+**复核员还可按段号把段落设为保密或解除保密**：保密立即作用于当前及全部历史版本的参与者视图，
+已发布版本、提议、异议与回应的原始记录均不改写（工作人员视图不受影响）。
 
 技术栈：Node.js（Express）+ SQLite（better-sqlite3）+ 无构建浏览器原生前端。
 
@@ -42,9 +44,9 @@ SQLite 数据库保存在命名卷 `hearing-revision-data`（容器内 `/data/he
 
 | 角色 | 用户名 | 密码 | 可执行操作 |
 | --- | --- | --- | --- |
-| 记录员 | `recorder` | `recorder123` | 导入逐字稿、提交修订提议 |
-| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议 |
-| 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议 |
+| 记录员 | `recorder` | `recorder123` | 导入逐字稿、提交修订提议、只读查看发布核对 |
+| 复核员 | `reviewer` | `reviewer123` | 采纳/驳回提议、发布前回应被触及异议、发布新版本、重新定位异议、**按段号保密/解除保密** |
+| 参与者 | `participant` | `participant123` | 对原文范围提出异议、重新定位自己的异议（保密段除外）；保密段只看到占位 |
 
 种子账户仅在数据库用户表为空时创建；可通过环境变量覆盖用户名与密码（见下文配置）。
 
@@ -139,6 +141,19 @@ npm test
      **“待重新定位”**警示，原文快照继续保留；可由提出者或复核员在当前版本上手动重新定位并留痕。
 7. **版本查看**：“版本”面板可只读查看任一历史版本的**正文、决议（采纳/驳回/冲突/续提/发布留痕）、
    异议与发布前异议回应**；历史版本内容不随后续发布改变。
+8. **段级保密（复核员，本轮新增）**：复核员在正文段尾点击“设为保密/解除保密”（或调用 HTTP API），
+   也可在工具栏“保密留痕”中查看全部变更。
+   - **保密以段号为准**：段号在各版本间不变（发布只改段内正文），一次设置**立即作用于当前及全部历史版本**的
+     参与者视图；**不改写**任何已发布版本、提议、异议、回应与决议原始记录——工作人员（记录员/复核员）始终看到全部内容。
+   - **参与者只看到保密占位**（“该段已按段号保密”），不获得该段正文、发布暂存预览、提议及其替换文字与依据、
+     异议原文与说明、发布前回应和决议；**发布核对**（`GET /api/publish-check` 及总览中的 `publishCheck`）
+     **仅供记录员与复核员查看**，参与者也**看不到版本备注**。
+   - 参与者**不得在保密段新建异议，也不得把异议重新定位进/出保密段**（服务端 403 拒绝）；
+     **保密前已存在的相关异议不删除、不改动**，仍由工作人员按原发布规则处理
+     （采纳修订、发布前逐条回应、发布后待重新定位、由复核员重新定位等），仅对参与者隐藏。
+   - **解除保密后**参与者重新可见该段正文与相关记录；保密/解除均在数据库事务中执行，
+     留痕**操作人、时间与前后状态**（`public → secret` / `secret → public`）。
+   - 失败均明确拒绝且不改变状态：未知段号 → 404；重复保密/对未保密段解除 → 409；非复核员操作 → 403。
 
 所有失败场景（无权操作、非法字符范围、重复发布、重复导入、重复采纳/重定位等）均返回明确的
 HTTP 状态码与中文原因，且在数据库事务中执行——失败即回滚，不改变任何状态。
@@ -158,7 +173,7 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | --- | --- | --- |
 | `POST /api/login` / `POST /api/logout` | 全部 | 登录 / 退出 |
 | `GET /api/me` | 全部 | 当前用户 |
-| `GET /api/booth` | 登录用户 | 当前版本正文、暂存区、提议、异议、版本列表 |
+| `GET /api/booth` | 登录用户 | 当前版本正文、暂存区、提议、异议、版本列表；含 `secretSegs` 保密段号集合，参与者视角下保密段返回占位并过滤相关记录（不含 `publishCheck` 与版本备注） |
 | `POST /api/doc/import` | 记录员 | 导入逐字稿（仅一次），形成 v1 |
 | `POST /api/proposals` | 记录员 | 提交提议 `{seg,start,end,replacement,basis}` |
 | `POST /api/proposals/:id/adopt` | 复核员 | 采纳；交叠/过期则返回冲突标记与原因 |
@@ -169,8 +184,11 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `POST /api/objections` | 登录用户 | 对原文范围提出异议 `{seg,start,end,note}` |
 | `POST /api/objections/:id/relocate` | 提出者或复核员 | 对“待重新定位”的异议手动重定位 |
 | `POST /api/objections/:id/respond` | 复核员 | 发布前对被暂存修订触及的异议填写非空回应 `{note}`；自动关联异议、触及提议、当前版本与暂存指纹。未被触及时返回 409 |
-| `GET /api/publish-check` | 登录用户 | 只读发布前核对：受影响异议、每条关联提议、回应绑定状态与失效原因（`missing` / `STAGE_CHANGED` / `ANCHOR_MOVED` / `PROPOSALS_CHANGED`）；`GET /api/booth` 的 `publishCheck` 字段内容相同 |
-| `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议/发布前异议回应） |
+| `GET /api/publish-check` | 记录员、复核员 | 只读发布前核对（参与者 403）：受影响异议、每条关联提议、回应绑定状态与失效原因（`missing` / `STAGE_CHANGED` / `ANCHOR_MOVED` / `PROPOSALS_CHANGED`）；工作人员的 `GET /api/booth` 在 `publishCheck` 字段返回相同内容 |
+| `POST /api/segments/:seg/secret` | 复核员 | **按段号设为保密**。未知段号 404、重复设置 409；留痕操作人/时间/前后状态，立即作用于当前及全部历史版本的参与者视图 |
+| `POST /api/segments/:seg/unsecret` | 复核员 | **解除保密**。未知段号 404、该段未保密时 409；解除后参与者重新可见 |
+| `GET /api/secret-logs` | 复核员 | 保密变更留痕列表（段号、动作、前后状态、操作人、时间） |
+| `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议/发布前异议回应）；参与者视角下保密段仅返回占位且按段过滤决议、异议、回应与版本备注 |
 
 ### 发布前异议回应调用示例（curl）
 
@@ -208,6 +226,52 @@ curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/publish \
 > 满足 `anchor.start ≤ 插入点 < anchor.end` 即触及（点在引用起点算、在终点不算）。
 > 采纳/驳回提议、重新定位异议后须重新核对；重新回应同一异议会取代其未发布旧回应（旧回应留痕）。
 
+### 段级保密调用示例（curl）
+
+```bash
+# 1) 复核员登录，保存会话 Cookie
+curl -i -c /tmp/rev.cookie -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"reviewer","password":"reviewer123"}'
+
+# 2) 把第 7 段设为保密（立即作用于当前及全部历史版本的参与者视图）
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/segments/7/secret
+# {"ok":true,"seg":7,"secret":true,"logId":12,"previousState":"public","newState":"secret"}
+
+# 3) 参与者总览/历史版本中该段只返回占位，且无该段提议、异议、发布核对与版本备注
+curl -s -b /tmp/par.cookie http://localhost:3000/api/booth
+#   {"seg":7,"text":"该段已按段号保密","secret":true}  // 不出现真实正文、stage.replacement、proposals/objections 记录
+curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1
+#   历史版本 v1 的第 7 段同样为占位（版本原始记录未被改写，工作人员仍可看到真实内容）
+
+# 4) 失败场景：明确拒绝且不改变状态
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/segments/999/secret
+#   404 {"error":"未知段号：当前版本 v3 中不存在第 999 段，无法设为保密","code":"NOT_FOUND"}
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/segments/7/secret
+#   409 {"error":"第 7 段已是保密状态，请勿重复设置","code":"ALREADY_SECRET"}
+# 参与者尝试保密（或访问发布核对/保密留痕）→ 403 FORBIDDEN
+curl -s -b /tmp/par.cookie -X POST http://localhost:3000/api/segments/7/secret
+#   403 {"error":"无权操作：参与者（participant）不能执行该操作，需要 reviewer 身份",…}
+
+# 5) 参与者在保密段新建/重新定位异议 → 403，状态不变
+curl -s -b /tmp/par.cookie -X POST http://localhost:3000/api/objections \
+  -H 'Content-Type: application/json' -d '{"seg":7,"start":0,"end":2,"note":"x"}'
+#   403 {"error":"第 7 段已保密：参与者不得在保密段新建异议","code":"FORBIDDEN"}
+
+# 6) 解除保密：参与者重新可见；工作人员的校订与发布流程始终不受影响
+curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/segments/7/unsecret
+# {"ok":true,"seg":7,"secret":false,"logId":13,"previousState":"secret","newState":"public"}
+
+# 7) 查看保密变更留痕（仅复核员）
+curl -s -b /tmp/rev.cookie http://localhost:3000/api/secret-logs
+# {"logs":[{"id":13,"seg":7,"action":"declassify","previous_state":"secret","new_state":"public",
+#           "created_at":"2026-10-01 01:02:03","actor_name":"复核员","actor_user":"reviewer"}, …]}
+```
+
+> 说明：保密状态以段号为键全局保存，不复制到每个版本——因此无需迁移历史数据，
+> 设置/解除即时对所有版本生效；`versions.segments_json`、`proposals`、`objections`、
+> `objection_responses` 等原始记录从不被更新，过滤只发生在面向参与者的视图层。
+
 ---
 
 ## 六、数据模型（SQLite）
@@ -224,6 +288,11 @@ curl -s -b /tmp/rev.cookie -X POST http://localhost:3000/api/publish \
   （`proposal_ids_json`）、回应时版本（`version_id`）、暂存区指纹（`stage_fingerprint`）与异议锚点快照；
   未发布草稿可被重新回应取代（`status='superseded'`，留痕保留），发布核对通过后写入
   `published_version_id` 随版只读归档。发布事务内重新核对绑定，任一缺失/失效即整体回滚。
+- `segment_secrets`：**段级保密状态**。以段号为主键（存在行即保密），全局一份，不随版本复制；
+  因发布只改段内正文、段号跨版本不变，故一条记录立即作用于当前及全部历史版本。
+- `secret_logs`：**保密/解除保密留痕**。记录段号、动作（`classify`/`declassify`）、操作人、
+  时间与前后状态（`previous_state`/`new_state`），不可变追加。保密不更新任何版本与业务记录表，
+  对参与者的屏蔽只在视图层按 `segment_secrets` 过滤。
 
 ---
 

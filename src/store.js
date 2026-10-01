@@ -70,6 +70,59 @@ function addDecision(db, { type, proposalId = null, versionId = null, actorId, r
   ).run(type, proposalId, versionId, actorId, reason, JSON.stringify(detail));
 }
 
+// ---------- 段级保密 ----------
+// 保密以段号为准：段号在各版本间不变（发布只改段内正文），故对当前及全部历史版本立即生效。
+const SECRET_PLACEHOLDER = '该段已按段号保密';
+
+function secretSegs(db) {
+  return new Set(db.prepare('SELECT seg FROM segment_secrets').all().map((r) => r.seg));
+}
+function isSecretSeg(db, seg) {
+  return !!db.prepare('SELECT 1 FROM segment_secrets WHERE seg=?').get(seg);
+}
+function isStaff(actor) {
+  return actor && (actor.role === 'reviewer' || actor.role === 'recordist');
+}
+
+// 复核员按段号保密/解除保密。未知段号 404、重复设置 409、无权由路由层拦截；事务内执行，失败不改状态。
+function setSegmentSecret(db, actor, seg, secret) {
+  if (!getDoc(db)) throw conflict('尚未导入逐字稿，无段号可保密', 'NO_DOCUMENT');
+  if (!Number.isInteger(seg)) throw badRequest('缺少有效的段号 seg');
+  const cur = latestVersion(db);
+  const segments = segmentsOf(cur);
+  if (segIndex(segments, seg) === -1) {
+    throw notFound(`未知段号：当前版本 v${cur.id} 中不存在第 ${seg} 段，无法${secret ? '设为保密' : '解除保密'}`);
+  }
+  return db.transaction(() => {
+    const already = isSecretSeg(db, seg);
+    if (secret && already) {
+      throw conflict(`第 ${seg} 段已是保密状态，请勿重复设置`, 'ALREADY_SECRET');
+    }
+    if (!secret && !already) {
+      throw conflict(`第 ${seg} 段当前未保密，无需解除`, 'ALREADY_PUBLIC');
+    }
+    if (secret) db.prepare('INSERT INTO segment_secrets (seg) VALUES (?)').run(seg);
+    else db.prepare('DELETE FROM segment_secrets WHERE seg=?').run(seg);
+    const previous = secret ? 'public' : 'secret';
+    const next = secret ? 'secret' : 'public';
+    const r = db.prepare(
+      `INSERT INTO secret_logs (seg, action, actor_id, previous_state, new_state)
+       VALUES (?,?,?,?,?)`
+    ).run(seg, secret ? 'classify' : 'declassify', actor.id, previous, next);
+    return { seg, secret, logId: r.lastInsertRowid, previousState: previous, newState: next };
+  })();
+}
+
+function listSecretLogs(db) {
+  return db
+    .prepare(
+      `SELECT l.id, l.seg, l.action, l.previous_state, l.new_state, l.created_at,
+              u.display_name AS actor_name, u.username AS actor_user
+       FROM secret_logs l JOIN users u ON u.id = l.actor_id
+       ORDER BY l.id DESC`
+    )
+    .all();
+}
 // ---------- 导入 ----------
 function importTranscript(db, actor, title, text) {
   if (getDoc(db)) throw conflict('逐字稿已导入并已发布初始版本，不能重复导入', 'ALREADY_INITIALIZED');
@@ -666,6 +719,10 @@ function createObjection(db, actor, body) {
   if (!note) throw badRequest('异议说明不能为空');
   const idx = segIndex(segments, seg);
   if (idx === -1) throw badRequest(`非法范围：当前版本 v${ver.id} 中不存在段 ${seg}`);
+  // 参与者不得在保密段新建异议；工作人员的既有校订/发布流程不受影响（已存在的相关异议仍按原规则处理）
+  if (!isStaff(actor) && isSecretSeg(db, seg)) {
+    throw forbidden(`第 ${seg} 段已保密：参与者不得在保密段新建异议`);
+  }
   const vr = validateRange(segments[idx].text, start, end);
   if (vr.start === vr.end) throw badRequest('异议必须引用非空的原文范围');
 
@@ -702,6 +759,10 @@ function relocateObjection(db, actor, id, body) {
   const start = parseInt(body.start, 10);
   const end = parseInt(body.end, 10);
   if (!Number.isInteger(seg)) throw badRequest('缺少有效的段号 seg');
+  // 参与者不得把异议重新定位到保密段；异议当前锚点位于保密段时也不得由参与者重新定位
+  if (!isStaff(actor) && (isSecretSeg(db, seg) || isSecretSeg(db, o.seg))) {
+    throw forbidden(`第 ${isSecretSeg(db, seg) ? seg : o.seg} 段已保密：参与者不得在保密段重新定位异议`);
+  }
   const idx = segIndex(segments, seg);
   if (idx === -1) throw badRequest(`非法范围：当前版本 v${ver.id} 中不存在段 ${seg}`);
   const vr = validateRange(segments[idx].text, start, end);
@@ -779,24 +840,10 @@ function respondToObjection(db, actor, id, note) {
 }
 
 // ---------- 视图组装 ----------
-function listProposals(db) {
-  return db
-    .prepare(
-      `SELECT p.*, u.display_name AS creator_name, u.username AS creator_user,
-              b.id AS base_ver,
-              (SELECT MIN(r.id) FROM proposals r WHERE r.rebased_from_id = p.id) AS continued_by_id
-       FROM proposals p
-       JOIN users u ON u.id = p.created_by
-       JOIN versions b ON b.id = p.base_version_id
-       ORDER BY p.id DESC`
-    )
-    .all();
-}
-
-function listObjections(db) {
+function listObjections(db, viewer) {
   const ver = latestVersion(db);
   if (!ver) return [];
-  return db
+  const rows = db
     .prepare(
       `SELECT o.id, o.seg, o.start_cp, o.end_cp, o.quoted_text, o.note, o.status,
               o.created_in_version, o.created_at,
@@ -808,38 +855,83 @@ function listObjections(db) {
        ORDER BY o.id DESC`
     )
     .all(ver.id);
+  // 保密段：参与者看不到该段任何异议（正文、原文快照与说明均不获得）
+  if (!isStaff(viewer)) {
+    const secrets = secretSegs(db);
+    return rows.filter((o) => !secrets.has(o.seg));
+  }
+  return rows;
 }
 
-function boothView(db) {
+function listProposals(db, viewer) {
+  const rows = db
+    .prepare(
+      `SELECT p.*, u.display_name AS creator_name, u.username AS creator_user,
+              b.id AS base_ver,
+              (SELECT MIN(r.id) FROM proposals r WHERE r.rebased_from_id = p.id) AS continued_by_id
+       FROM proposals p
+       JOIN users u ON u.id = p.created_by
+       JOIN versions b ON b.id = p.base_version_id
+       ORDER BY p.id DESC`
+    )
+    .all();
+  // 保密段：参与者看不到该段提议及依据/原文摘录
+  if (!isStaff(viewer)) {
+    const secrets = secretSegs(db);
+    return rows.filter((p) => !secrets.has(p.seg));
+  }
+  return rows;
+}
+
+function boothView(db, viewer) {
   const doc = getDoc(db);
   if (!doc) return { initialized: false };
   const ver = latestVersion(db);
-  const segments = segmentsOf(ver);
+  const secrets = secretSegs(db);
+  const staff = isStaff(viewer);
+  const rawSegments = segmentsOf(ver);
   const stage = stageProposals(db, ver.id);
-  return {
+  // 参与者视角：保密段正文替换为占位；该段暂存修订整条剔除（不泄露段内替换文字）
+  const maskSeg = (s) => (staff || !secrets.has(s.seg) ? s : { seg: s.seg, text: SECRET_PLACEHOLDER, secret: true });
+  const segments = rawSegments.map(maskSeg);
+  const view = {
     initialized: true,
     title: doc.title,
-    currentVersion: { id: ver.id, note: ver.note, createdAt: ver.created_at },
+    currentVersion: {
+      id: ver.id,
+      note: staff ? ver.note : '', // 参与者不显示版本备注
+      createdAt: ver.created_at,
+    },
     segments,
-    stage: stage.map((p) => ({ id: p.id, seg: p.seg, start: p.start_cp, end: p.end_cp, replacement: p.replacement })),
-    previewSegments: previewSegments(segments, stage),
-    // 发布前回应门槛：哪些异议被暂存修订触及、是否已有有效回应、失效原因
-    publishCheck: publishGate(db, ver, stage),
-    proposals: listProposals(db),
-    objections: listObjections(db),
+    secretSegs: [...secrets].sort((a, b) => a - b),
+    stage: stage
+      .filter((p) => staff || !secrets.has(p.seg))
+      .map((p) => ({ id: p.id, seg: p.seg, start: p.start_cp, end: p.end_cp, replacement: p.replacement })),
+    previewSegments: (staff
+      ? previewSegments(rawSegments, stage)
+      : previewSegments(rawSegments, stage.filter((p) => !secrets.has(p.seg)))
+    ).map(maskSeg),
+    proposals: listProposals(db, viewer),
+    objections: listObjections(db, viewer),
     versions: db
       .prepare(
         `SELECT v.id, v.note, v.created_at, u.display_name AS creator_name
          FROM versions v LEFT JOIN users u ON u.id = v.created_by ORDER BY v.id`
       )
-      .all(),
+      .all()
+      .map((v) => (staff ? v : { id: v.id, note: '', created_at: v.created_at, creator_name: v.creator_name })),
   };
+  // 发布核对仅供记录员与复核员查看：参与者响应中不含该字段
+  if (staff) view.publishCheck = publishGate(db, ver, stage);
+  return view;
 }
 
-function versionView(db, id) {
+function versionView(db, id, viewer) {
   const v = db.prepare('SELECT * FROM versions WHERE id=?').get(id);
   if (!v) throw notFound(`版本 v${id} 不存在`);
-  const decisions = db
+  const staff = isStaff(viewer);
+  const secrets = secretSegs(db); // 以当前保密段号集合为准，立即作用于全部历史版本
+  let decisions = db
     .prepare(
       `SELECT d.id, d.type, d.reason, d.created_at, d.proposal_id, d.version_id,
               u.display_name AS actor_name,
@@ -853,7 +945,7 @@ function versionView(db, id) {
        ORDER BY d.id`
     )
     .all(v.decision_watermark);
-  const objections = db
+  let objections = db
     .prepare(
       `SELECT a.objection_id AS id, a.seg, a.start_cp, a.end_cp, a.status,
               o.quoted_text, o.note, o.created_in_version, o.created_at,
@@ -865,8 +957,7 @@ function versionView(db, id) {
        ORDER BY a.objection_id`
     )
     .all(v.id);
-  // 随本版本发布的异议回应（只读归档）
-  const responses = db
+  let responses = db
     .prepare(
       `SELECT r.id, r.objection_id, r.note, r.proposal_ids_json, r.seg,
               r.start_cp, r.end_cp, r.version_id, r.published_version_id, r.created_at,
@@ -876,17 +967,23 @@ function versionView(db, id) {
        WHERE r.published_version_id = ?
        ORDER BY r.objection_id, r.id`
     )
-    .all(v.id)
-    .map((r) => ({
-      ...r,
-      proposalIds: JSON.parse(r.proposal_ids_json),
-    }));
+    .all(v.id);
+  if (!staff) {
+    // 参与者查看历史版本：保密段只留占位；不获得该段决议（提议/依据/替换文字）、异议与回应
+    decisions = decisions.filter((d) => d.seg == null || !secrets.has(d.seg));
+    objections = objections.filter((o) => !secrets.has(o.seg));
+    responses = responses.filter((r) => !secrets.has(r.seg));
+  }
+  responses = responses.map((r) => ({ ...r, proposalIds: JSON.parse(r.proposal_ids_json) }));
   return {
     id: v.id,
-    note: v.note,
+    note: staff ? v.note : '', // 参与者不显示版本备注
     createdAt: v.created_at,
     immutable: true,
-    segments: segmentsOf(v),
+    secretSegs: [...secrets].sort((a, b) => a - b),
+    segments: segmentsOf(v).map((s) =>
+      staff || !secrets.has(s.seg) ? s : { seg: s.seg, text: SECRET_PLACEHOLDER, secret: true }
+    ),
     decisions,
     objections,
     responses,
@@ -910,6 +1007,10 @@ module.exports = {
   versionView,
   stageProposals,
   previewSegments,
+  setSegmentSecret,
+  listSecretLogs,
+  secretSegs,
+  SECRET_PLACEHOLDER,
   getDoc,
   latestVersion,
   segmentsOf,

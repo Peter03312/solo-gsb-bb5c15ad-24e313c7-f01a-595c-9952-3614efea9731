@@ -473,9 +473,16 @@ async function main() {
      gA.proposalIds.length === 1 && gA.proposalIds[0] === q1.json.id,
     `门槛列出待回应异议 #${oaid}，关联已采纳提议 #${q1.json.id}，尚无回应`);
   ok(!gate.items.some((x) => x.objectionId === oOther.json.id), '未被暂存修订触及的异议不进入受影响集合');
+  // 发布核对仅供记录员与复核员：参与者的 booth 不含 publishCheck 字段
   booth = (await req('GET', '/api/booth', null, par)).json;
-  ok(JSON.stringify(booth.publishCheck.items).includes(String(oaid)),
-    'GET /api/booth 的 publishCheck 同样暴露待回应项（参与者只读可见）');
+  ok(booth.publishCheck === undefined, '参与者总览不包含发布核对（publishCheck）');
+  const boothRev = (await req('GET', '/api/booth', null, rev)).json;
+  ok(JSON.stringify(boothRev.publishCheck.items).includes(String(oaid)),
+    '复核员总览的 publishCheck 仍暴露待回应项');
+  const pcPar = await req('GET', '/api/publish-check', null, par);
+  ok(pcPar.status === 403 && pcPar.json.code === 'FORBIDDEN', '参与者直接访问 /api/publish-check 被拒绝（403）');
+  const pcRec = await req('GET', '/api/publish-check', null, rec);
+  ok(pcRec.status === 200, '记录员可只读查看发布核对');
 
   // 无受影响异议时可按原规则发布：清空暂存后空发布仍按既有规则拒绝
   await req('POST', `/api/proposals/${q1.json.id}/reject`, { reason: '暂缓' }, rev);
@@ -664,6 +671,140 @@ async function main() {
     '零长度修订插入点恰在引用终点：半开区间不算触及，无需回应');
   const pub15b = await req('POST', '/api/publish', { note: '插入标点（未触及异议）' }, rev);
   ok(pub15b.status === 201, '无受影响异议：按原规则直接发布成功');
+
+  console.log('\n[段级保密：权限、未知段号与重复设置]');
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const secretVer = booth.currentVersion.id;
+  const seg1now0 = booth.segments.find((s) => s.seg === 1).text; // 经多轮修订的第1段
+  // 只有复核员可保密：记录员/参与者被拒绝
+  await expectFail(req('POST', '/api/segments/1/secret', {}, rec), 403, '无权操作', '记录员尝试保密');
+  await expectFail(req('POST', '/api/segments/1/secret', {}, par), 403, '无权操作', '参与者尝试保密');
+  // 未知段号 404，且不改变状态
+  await expectFail(req('POST', '/api/segments/999/secret', {}, rev), 404, '未知段号', '保密未知段号');
+  await expectFail(req('POST', '/api/segments/999/unsecret', {}, rev), 404, '未知段号', '解除未知段号');
+  // 未保密段解除：409 重复/无效设置
+  await expectFail(req('POST', '/api/segments/1/unsecret', {}, rev), 409, '未保密', '对未保密段解除保密');
+
+  console.log('\n[段级保密：参与者总览与全部历史版本只留占位]');
+  const sec1 = await req('POST', '/api/segments/1/secret', {}, rev);
+  assert.strictEqual(sec1.status, 201);
+  ok(sec1.json.secret === true && sec1.json.previousState === 'public' && sec1.json.newState === 'secret',
+    `保密成功并返回前后状态（留痕 #${sec1.json.logId}）`);
+  // 重复保密：409，不改变状态
+  await expectFail(req('POST', '/api/segments/1/secret', {}, rev), 409, '已是保密', '重复保密');
+
+  const boothPar = (await req('GET', '/api/booth', null, par)).json;
+  const sp = boothPar.segments.find((s) => s.seg === 1);
+  ok(sp.secret === true && sp.text === '该段已按段号保密', '参与者总览：第1段只看到保密占位');
+  ok(!sp.text.includes('现在') && !seg1now0.includes(sp.text), '参与者不获得第1段正文');
+  ok(boothPar.secretSegs.includes(1), '总览含当前保密段号集合');
+  ok(boothPar.segments.find((s) => s.seg === 2).secret !== true, '非保密段参与者仍可见正文');
+  // 暂存/提议/异议/发布核对：第1段相关内容一律不出现
+  ok(!boothPar.stage.some((p) => p.seg === 1), '参与者看不到第1段暂存修订（含替换文字）');
+  ok(!boothPar.proposals.some((p) => p.seg === 1), '参与者看不到第1段提议及依据/摘录');
+  ok(!boothPar.objections.some((o) => o.seg === 1), '参与者看不到第1段异议');
+  ok(boothPar.publishCheck === undefined, '参与者总览不含发布核对');
+  ok(boothPar.currentVersion.note === '', '参与者不显示当前版本备注');
+  // 工作人员视图不受影响
+  const boothStaff = (await req('GET', '/api/booth', null, rev)).json;
+  ok(boothStaff.segments.find((s) => s.seg === 1).text === seg1now0, '复核员仍看到第1段真实正文');
+  ok(boothStaff.publishCheck && Array.isArray(boothStaff.publishCheck.items), '复核员总览保留发布核对');
+
+  // 立即作用于全部历史版本：v1（原文）与 v4（修订后）都只留占位，且决议/异议/回应按段过滤
+  for (const vid of [1, 4, secretVer]) {
+    const vv = (await req('GET', `/api/versions/${vid}`, null, par)).json;
+    const s1 = vv.segments.find((s) => s.seg === 1);
+    ok(s1.secret === true && s1.text === '该段已按段号保密', `参与者查看 v${vid}：第1段为保密占位`);
+    ok(vv.note === '', `参与者查看 v${vid}：不显示版本备注`);
+    ok(!vv.decisions.some((d) => d.seg === 1), `参与者 v${vid} 决议视图不含第1段留痕`);
+    ok(!vv.objections.some((o) => o.seg === 1), `参与者 v${vid} 异议视图不含第1段记录`);
+    ok(!vv.responses.some((r) => r.seg === 1), `参与者 v${vid} 发布前回应视图不含第1段记录`);
+  }
+  // 工作人员的历史版本视图：原始记录不改写
+  const v1Staff = (await req('GET', '/api/versions/1', null, rec)).json;
+  ok(v1Staff.segments.find((s) => s.seg === 1).text.includes('现在开庭'), '记录员查看 v1：第1段原文快照保持不变');
+  const v4Staff = (await req('GET', '/api/versions/4', null, rev)).json;
+  ok(v4Staff.segments.find((s) => s.seg === 1).text.includes('现在宣布开庭'),
+    '复核员查看 v4：第1段已发布正文保持不变（保密不改写历史版本）');
+
+  console.log('\n[段级保密：参与者不得在保密段新建或重新定位异议]');
+  const s1len = Array.from(seg1now0).length;
+  await expectFail(req('POST', '/api/objections',
+    { seg: 1, start: 0, end: Math.min(2, s1len), note: '尝试在保密段提异议' }, par),
+    403, '保密', '参与者在保密段新建异议被拒绝');
+  // 工作人员仍可按既有规则处理（记录员可对保密段提修订提议，流程不变）
+  const pSec = await req('POST', '/api/proposals',
+    { seg: 1, start: 0, end: 1, replacement: seg1now0[0], basis: '保密段不影响工作人员校订' }, rec);
+  ok(pSec.status === 201, '记录员仍可对保密段提交修订提议（既有流程不变）');
+  // 已存在的相关异议仍由工作人员按原发布规则处理：参与者在第2段提异议后保密第2段，
+  // 复核员仍可对其重定位（模拟 needs_relocation 场景：用第3段修订不触及第2段，改为直接复核流程）
+  const seg2cur = boothStaff.segments.find((s) => s.seg === 2).text;
+  const iSecO = cpIndexOf(seg2cur, '3月');
+  const oSec = await req('POST', '/api/objections',
+    { seg: 2, start: iSecO, end: iSecO + 2, note: '保密前已存在的异议' }, par);
+  assert.strictEqual(oSec.status, 201);
+  const oSecId = oSec.json.id;
+  await req('POST', '/api/segments/2/secret', {}, rev);
+  // 保密后该异议对参与者不可见（含原文快照与说明）
+  let boothPar2 = (await req('GET', '/api/booth', null, par)).json;
+  ok(!boothPar2.objections.some((o) => o.id === oSecId), '保密后参与者看不到既存异议的原文与说明');
+  // 复核员仍看得到并可按原发布规则处理该异议（异议主记录未改写）
+  const boothRev2 = (await req('GET', '/api/booth', null, rev)).json;
+  ok(boothRev2.objections.some((o) => o.id === oSecId && o.quoted_text === '3月'),
+    '复核员仍可查看并按原规则处理保密段的既存异议');
+
+  // 记录员就同一范围提修订，复核员采纳→发布前回应门槛照常作用于保密段异议→回应→发布
+  const pSec2 = await req('POST', '/api/proposals',
+    { seg: 2, start: iSecO, end: iSecO + 2, replacement: '三月', basis: '数字写法统一' }, rec);
+  assert.strictEqual(pSec2.status, 201);
+  await req('POST', `/api/proposals/${pSec2.json.id}/adopt`, {}, rev);
+  const gateSec = (await req('GET', '/api/publish-check', null, rev)).json;
+  const gSec = gateSec.items.find((x) => x.objectionId === oSecId);
+  ok(gSec && gSec.proposalIds.includes(pSec2.json.id), '保密段既存异议仍进入发布前核对（按原规则处理）');
+  await expectFail(req('POST', '/api/publish', { note: '保密段修订' }, rev),
+    409, '未完成有效回应', '保密段异议未回应时发布仍被拒绝');
+  await clearGate(rev);
+  const pubSec = await req('POST', '/api/publish', { note: '保密段第2段写法统一' }, rev);
+  ok(pubSec.status === 201, '回应后保密段修订照常发布；异议事后置为待重新定位');
+  // 参与者看不到该新版本备注，且新版本中第2段仍为占位
+  boothPar2 = (await req('GET', '/api/booth', null, par)).json;
+  ok(boothPar2.segments.find((s) => s.seg === 2).secret === true, '发布后新版本的保密段对参与者仍立即是占位');
+  ok(boothPar2.currentVersion.note === '', '参与者看不到新版本备注');
+
+  console.log('\n[段级保密：解除后重新可见，留痕完整]');
+  let logs = (await req('GET', '/api/secret-logs', null, rev)).json.logs;
+  const c2 = logs.find((l) => l.seg === 2 && l.action === 'classify');
+  ok(c2 && c2.actor_user === 'reviewer' && c2.previous_state === 'public' && c2.new_state === 'secret' && c2.created_at,
+    '保密留痕记录段号、操作人、时间与前后状态');
+  await expectFail(req('GET', '/api/secret-logs', null, par), 403, '无权操作', '参与者查看保密留痕');
+  await expectFail(req('GET', '/api/secret-logs', null, rec), 403, '无权操作', '记录员查看保密留痕');
+
+  // 参与者对保密段上待重新定位的异议（即便为提出者）也不能重新定位
+  await expectFail(req('POST', `/api/objections/${oSecId}/relocate`,
+    { seg: 3, start: 0, end: 1 }, par), 403, '保密', '参与者把保密段异议重定位出去被拒绝');
+  // 复核员可以处理该异议（在非保密的第3段重定位）
+  const rlStaff = await req('POST', `/api/objections/${oSecId}/relocate`,
+    { seg: 3, start: 0, end: 1 }, rev);
+  ok(rlStaff.status === 200, '复核员可按原规则重新定位保密段的既存异议');
+
+  // 解除第1、2段
+  const un1 = await req('POST', '/api/segments/1/unsecret', {}, rev);
+  assert.strictEqual(un1.status, 200);
+  ok(un1.json.previousState === 'secret' && un1.json.newState === 'public', '解除保密返回前后状态');
+  await req('POST', '/api/segments/2/unsecret', {}, rev);
+  const boothPar3 = (await req('GET', '/api/booth', null, par)).json;
+  ok(!boothPar3.secretSegs.includes(1) && !boothPar3.secretSegs.includes(2), '解除后保密集合清空');
+  ok(boothPar3.segments.find((s) => s.seg === 1).text === seg1now0, '解除后参与者重新看到第1段正文');
+  // 异议已被复核员重定位到第3段：参与者可在第3段看到它；第2段原锚点记录仍保留在历史版本
+  ok(boothPar3.objections.some((o) => o.id === oSecId && o.seg === 3), '解除后参与者重新看到相关异议（当前锚点在第3段）');
+  const v1After = (await req('GET', '/api/versions/1', null, par)).json;
+  ok(v1After.segments.find((s) => s.seg === 1).text.includes('现在开庭'),
+    '解除后历史版本 v1 的第1段原文重新可见（版本本身从未被改写）');
+  // 解除留痕同样完整（按段号、操作人、时间与前后状态 secret → public）
+  logs = (await req('GET', '/api/secret-logs', null, rev)).json.logs;
+  const d1 = logs.find((l) => l.seg === 1 && l.action === 'declassify');
+  ok(d1 && d1.previous_state === 'secret' && d1.new_state === 'public',
+    '解除保密留痕完整（secret → public，含操作人与时间）');
 
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);

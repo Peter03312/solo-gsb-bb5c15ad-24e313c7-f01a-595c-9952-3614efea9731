@@ -49,8 +49,8 @@ app.post('/api/logout', wrap((req, res) => {
 app.get('/api/me', (req, res) => res.json({ user: publicUser(req.user) }));
 
 // ---------- 校订台总览 ----------
-app.get('/api/booth', requireAuth, wrap((_req, res) => {
-  res.json(store.boothView(db));
+app.get('/api/booth', requireAuth, wrap((req, res) => {
+  res.json(store.boothView(db, req.user));
 }));
 
 // ---------- 导入（记录员，仅一次） ----------
@@ -113,8 +113,9 @@ app.post('/api/objections/:id/respond', requireRole('reviewer'), wrap((req, res)
   res.status(201).json({ ok: true, ...result });
 }));
 
-// 发布前核对（只读）：待回应异议、关联提议与回应状态/失效原因；与 GET /api/booth 的 publishCheck 相同
-app.get('/api/publish-check', requireAuth, wrap((_req, res) => {
+// 发布前核对（只读）：仅记录员与复核员可见待回应异议、关联提议与回应状态/失效原因；
+// 与 GET /api/booth 中工作人员视图的 publishCheck 相同（参与者视图不含该字段）。
+app.get('/api/publish-check', requireRole('recordist', 'reviewer'), wrap((_req, res) => {
   const ver = store.latestVersion(db);
   if (!ver || !store.getDoc(db)) {
     return res.json({ initialized: false, versionId: null, stageFp: '', items: [] });
@@ -122,9 +123,25 @@ app.get('/api/publish-check', requireAuth, wrap((_req, res) => {
   res.json({ initialized: true, ...store.publishGate(db, ver) });
 }));
 
+// ---------- 段级保密（复核员）：按段号保密/解除，留痕操作人、时间与前后状态 ----------
+app.post('/api/segments/:seg/secret', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.setSegmentSecret(db, req.user, parseInt(req.params.seg, 10), true);
+  res.status(201).json({ ok: true, ...result });
+}));
+
+app.post('/api/segments/:seg/unsecret', requireRole('reviewer'), wrap((req, res) => {
+  const result = store.setSegmentSecret(db, req.user, parseInt(req.params.seg, 10), false);
+  res.json({ ok: true, ...result });
+}));
+
+// 保密变更留痕（仅复核员查看）
+app.get('/api/secret-logs', requireRole('reviewer'), wrap((_req, res) => {
+  res.json({ logs: store.listSecretLogs(db) });
+}));
+
 // ---------- 不可变版本视图 ----------
 app.get('/api/versions/:id', requireAuth, wrap((req, res) => {
-  res.json(store.versionView(db, parseInt(req.params.id, 10)));
+  res.json(store.versionView(db, parseInt(req.params.id, 10), req.user));
 }));
 
 // ---------- 静态前端 ----------

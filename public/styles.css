@@ -196,6 +196,32 @@ body {
 .seg-body.selectable ::selection { background: #c8d39c; }
 .seg-body.selectable { cursor: text; }
 
+/* 段级保密 */
+.seg.is-secret { background: #f6f3ea; border-radius: 6px; }
+.seg-no-secret { color: var(--danger); font-weight: 700; }
+.secret-placeholder {
+  display: inline-block;
+  color: #7a6b4f;
+  background: #efece1;
+  border: 1px dashed #c8bfa6;
+  border-radius: 4px;
+  padding: 2px 10px;
+  user-select: none;
+}
+.secret-toggle {
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.secret-tag {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--danger);
+  user-select: none;
+}
+.btn.tiny { padding: 1px 8px; font-size: 12px; }
+.secret-log-list { max-height: 52vh; overflow-y: auto; }
+
 /* 标记 */
 .mk { border-radius: 2px; padding: 0 1px; cursor: pointer; border-bottom: 2px solid transparent; }
 .mk-adopted { background: var(--adopt-bg); border-bottom-color: var(--adopt-border); }
